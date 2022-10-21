@@ -1,0 +1,717 @@
+-- Databricks notebook source
+-- MAGIC %md # H3 Proximity Analysis (Spark SQL)
+-- MAGIC 
+-- MAGIC <img src="https://camo.githubusercontent.com/7d659087f179cb105dd0b91854bcc00d7b0a15d61cdac0e3d2afe05993dc63a7/68747470733a2f2f756265722e6769746875622e696f2f696d672f68334c6f676f2d636f6c6f722e737667" width="10%"/>
+-- MAGIC 
+-- MAGIC > Use Built-In [H3 Product APIs](https://docs.databricks.com/spark/latest/spark-sql/language-manual/sql-ref-functions-builtin.html#h3-geospatial-functions) to analyze distance of each h3 cell of interest to resource of interest, in this case food stores. Will consider both straight line distance and road distance.
+-- MAGIC 
+-- MAGIC __ESTABLISHMENT CODES__
+-- MAGIC |   |   | 
+-- MAGIC |---|---|
+-- MAGIC | A(3)–Store | M – Salvage Dealer |
+-- MAGIC | B – Bakery | N – Wholesale Produce Packer |
+-- MAGIC | C – Food Manufacturer | O – Produce Grower/Packer/Broker, Storage |
+-- MAGIC | D – Food Warehouse | P – C.A. Room |
+-- MAGIC | E – Beverage Plant | Q – Feed Mill/Medicated |
+-- MAGIC | F – Feed Mill/Non-Medicated | R – Pet Food Manufacturer |
+-- MAGIC | G - Processing Plant | S – Feed Warehouse and/or Distributor |
+-- MAGIC | H - Wholesale Manufacturer | T – Disposal Plant |
+-- MAGIC | I - Refrigerated Warehouse | U - Disposal Plant/Transportation Service |
+-- MAGIC | J – Multiple Operations | V – Slaughterhouse |
+-- MAGIC | K - Vehicle | W – Farm Winery-Exempt |
+-- MAGIC | L - Produce Refrigerated Warehouse | Z - Farm Product Use Only |
+-- MAGIC 
+-- MAGIC --- 
+-- MAGIC __Author: Michael Johns <mjohns@databricks.com>__  
+-- MAGIC _Last Modified: 18 OCT 2022_
+
+-- COMMAND ----------
+
+-- MAGIC %md ## Setup (Spark SQL)
+-- MAGIC <p/>
+-- MAGIC 
+-- MAGIC __Note: If you hit `H3_NOT_ENABLED` [[docs](https://docs.databricks.com/error-messages/h3-not-enabled-error-class.html#h3_not_enabled-error-class)]__
+-- MAGIC 
+-- MAGIC > `h3Expression` is disabled or unsupported. Consider enabling Photon or switch to a tier that supports H3 expressions. [[AWS](https://www.databricks.com/product/aws-pricing) | [Azure](https://azure.microsoft.com/en-us/pricing/details/databricks/) | [GCP](https://www.databricks.com/product/gcp-pricing)]
+-- MAGIC 
+-- MAGIC __Recommend running on DBR 11.3+ for maximizing photonized functions.__
+
+-- COMMAND ----------
+
+-- MAGIC %sh /databricks/python3/bin/pip3 install h3==3.7.0 keplergl --quiet # <-- installing just on driver for SPARK SQL
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC """
+-- MAGIC 1. Using [H3 OSS](https://h3geo.org/) library standalone within a python cell:
+-- MAGIC   * We only need this on the driver, since we are in SPARK SQL calling `%sh /databricks/python3/bin/pip3 install h3==3.7.0` [[1](https://docs.databricks.com/release-notes/runtime/11.2.html#installed-java-and-scala-libraries-scala-212-cluster-version)] to match built-in native and JAR
+-- MAGIC   * Import with `import h3 as h3lib`
+-- MAGIC 1. To use [Kepler.gl](https://kepler.gl/) OSS library for map layer rendering within a python cell:
+-- MAGIC   * We only need this on the driver, since we are in SPARK SQL calling `%sh /databricks/python3/bin/pip3 install keplergl`
+-- MAGIC   * Import with `from keplergl import KeplerGl`
+-- MAGIC """
+-- MAGIC 
+-- MAGIC import h3 as h3lib # <-- want to use product where possible
+-- MAGIC 
+-- MAGIC import matplotlib.pyplot as plt
+-- MAGIC import matplotlib.image as img
+-- MAGIC plt.rcParams["figure.figsize"] = [8, 6] # <-- inches
+-- MAGIC plt.rcParams["figure.autolayout"] = True
+-- MAGIC 
+-- MAGIC from pyspark.databricks.sql.functions import * # <-- import python product functions
+-- MAGIC 
+-- MAGIC from pyspark.sql import functions as F
+-- MAGIC from pyspark.sql.functions import udf, col
+-- MAGIC from pyspark.sql.types import *
+-- MAGIC from pyspark.sql import Window
+-- MAGIC 
+-- MAGIC from keplergl import KeplerGl
+-- MAGIC def display_kepler(kmap:KeplerGl, height=800, width=1200) -> None:
+-- MAGIC   """
+-- MAGIC   Convenience function to render map in kepler.gl
+-- MAGIC   - use this when cannot directly render or
+-- MAGIC     want to go beyond the %%mosaic_kepler magic.
+-- MAGIC   """
+-- MAGIC   displayHTML(
+-- MAGIC     kmap
+-- MAGIC       ._repr_html_()
+-- MAGIC         .decode("utf-8")
+-- MAGIC       .replace(".height||400", f".height||{height}")
+-- MAGIC       .replace(".width||400", f".width||{width}")
+-- MAGIC   )
+
+-- COMMAND ----------
+
+-- MAGIC %run ./Helpers/nyc_data_config.py
+
+-- COMMAND ----------
+
+-- MAGIC %sql show tables
+
+-- COMMAND ----------
+
+-- MAGIC %md ## Assess Approximate H3 Cell Size for NYC
+-- MAGIC 
+-- MAGIC > H3 cells are projected onto a sphere so size is not uniform depending on the latitude of the cell as well as other various distortions that are unavoidable. For NYC we see that H3 size is approximately __18.3m or 60ft__ between neighbor cell centerpoints at __Resolution 12__. We will use this as the basis for our K-Ring and Hex Ring analysis.
+
+-- COMMAND ----------
+
+-- MAGIC %sql -- cell
+-- MAGIC create
+-- MAGIC or replace temp view cell_size as (
+-- MAGIC   select
+-- MAGIC     cell,
+-- MAGIC     cell_str,
+-- MAGIC     h3_centerasgeojson(cell) as cell_center,
+-- MAGIC     h3_kring(cell, 1) as cell_kring_1
+-- MAGIC   from
+-- MAGIC     store_cell
+-- MAGIC );
+-- MAGIC 
+-- MAGIC -- neighbor
+-- MAGIC create
+-- MAGIC or replace temp view neighbor_size as (
+-- MAGIC   select
+-- MAGIC     *
+-- MAGIC   except(cell_kring_1),
+-- MAGIC     h3_centerasgeojson(neighbor_str) as neighbor_center
+-- MAGIC   from
+-- MAGIC     (
+-- MAGIC       select
+-- MAGIC         *,
+-- MAGIC         h3_h3tostring(cell_kring_1 [1]) as neighbor_str
+-- MAGIC       from
+-- MAGIC         cell_size
+-- MAGIC     )
+-- MAGIC );
+-- MAGIC select
+-- MAGIC   *
+-- MAGIC from
+-- MAGIC   neighbor_size
+-- MAGIC limit
+-- MAGIC   1;
+
+-- COMMAND ----------
+
+-- MAGIC %md __Use H3 OSS lib [point_dist](https://h3geo.org/docs/3.x/api/misc#pointdistm) to get distance between 2 neighbor cells__
+-- MAGIC 
+-- MAGIC > Gives the "great circle" or "haversine" distance between pairs of GeoCoord points (lat/lng pairs) in meters, kilometers, or radians (defaults to kilometers).
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC print(f"""approximate distance in meters? {h3lib.point_dist(h3lib.h3_to_geo("8c2a154e5376bff"), h3lib.h3_to_geo("8c2a154e53769ff"), unit='m'):,}""")
+-- MAGIC print(f"""approximate distance in kilometers? {h3lib.point_dist(h3lib.h3_to_geo("8c2a154e5376bff"), h3lib.h3_to_geo("8c2a154e53769ff"), unit='km'):,}""")
+-- MAGIC print(f"""approximate distance in radians? {h3lib.point_dist(h3lib.h3_to_geo("8c2a154e5376bff"), h3lib.h3_to_geo("8c2a154e53769ff"), unit='rads'):,}""")
+
+-- COMMAND ----------
+
+-- MAGIC %md ## Food Store H3 K-Rings
+-- MAGIC 
+-- MAGIC > Use K-Rings of values up to 20 for access to stores in increments of 5. _This equates to straight line distances of up to 1200 ft or just under 1/4 mile at 20 k-rings and 1/8 mile at 10 k-rings._
+-- MAGIC 
+-- MAGIC __Number Cells per Ring__
+-- MAGIC <p/>
+-- MAGIC 
+-- MAGIC * `K-Ring = 05`: 91 cells
+-- MAGIC * `K-Ring = 10`: 331 cells
+-- MAGIC * `K-Ring = 15`: 721 cells
+-- MAGIC * `K-Ring = 20`: 1,261 cells
+-- MAGIC 
+-- MAGIC __Note: We filter by NYC counties, yielding 13.4K Food Stores.__
+
+-- COMMAND ----------
+
+-- MAGIC %sql create
+-- MAGIC or replace temp view store_kring_agg as (
+-- MAGIC   select
+-- MAGIC     cell,
+-- MAGIC     county,
+-- MAGIC     zip_code,
+-- MAGIC     entity_name,
+-- MAGIC     size(k5) as num_k5,
+-- MAGIC     size(k10) as num_k10,
+-- MAGIC     size(k15) as num_k15,
+-- MAGIC     size(k20) as num_k20,
+-- MAGIC     *
+-- MAGIC   except(cell, county, zip_code, entity_name)
+-- MAGIC   from
+-- MAGIC     (
+-- MAGIC       select
+-- MAGIC         *,
+-- MAGIC         h3_kring(cell, 5) as k5,
+-- MAGIC         h3_kring(cell, 10) as k10,
+-- MAGIC         h3_kring(cell, 15) as k15,
+-- MAGIC         h3_kring(cell, 20) as k20
+-- MAGIC       from
+-- MAGIC         store_cell
+-- MAGIC       where
+-- MAGIC         isnotnull(cell)
+-- MAGIC     )
+-- MAGIC   where
+-- MAGIC     county in (
+-- MAGIC       select
+-- MAGIC         distinct county
+-- MAGIC       from
+-- MAGIC         store_cell
+-- MAGIC     )
+-- MAGIC );
+-- MAGIC select
+-- MAGIC   *
+-- MAGIC from
+-- MAGIC   store_kring_agg
+
+-- COMMAND ----------
+
+-- MAGIC %md __Explode K-Ring cells for 1 cell per row with a separate view per level__
+
+-- COMMAND ----------
+
+-- MAGIC %sql -- kring = 5
+-- MAGIC create
+-- MAGIC or replace temp view store_k5 as (
+-- MAGIC   select
+-- MAGIC     cell as store_cell,
+-- MAGIC     explode(k5) as k_cell,
+-- MAGIC     5 as ring_k,
+-- MAGIC     county,
+-- MAGIC     zip_code,
+-- MAGIC     entity_name,
+-- MAGIC     establishment_type,
+-- MAGIC     license_number
+-- MAGIC   from
+-- MAGIC     store_kring_agg
+-- MAGIC );
+-- MAGIC 
+-- MAGIC -- kring = 10
+-- MAGIC create
+-- MAGIC or replace temp view store_k10 as (
+-- MAGIC   select
+-- MAGIC     cell as store_cell,
+-- MAGIC     explode(k10) as k_cell,
+-- MAGIC     10 as ring_k,
+-- MAGIC     county,
+-- MAGIC     zip_code,
+-- MAGIC     entity_name,
+-- MAGIC     establishment_type,
+-- MAGIC     license_number
+-- MAGIC   from
+-- MAGIC     store_kring_agg
+-- MAGIC );
+-- MAGIC 
+-- MAGIC -- kring = 15
+-- MAGIC create
+-- MAGIC or replace temp view store_k15 as (
+-- MAGIC   select
+-- MAGIC     cell as store_cell,
+-- MAGIC     explode(k15) as k_cell,
+-- MAGIC     15 as ring_k,
+-- MAGIC     county,
+-- MAGIC     zip_code,
+-- MAGIC     entity_name,
+-- MAGIC     establishment_type,
+-- MAGIC     license_number
+-- MAGIC   from
+-- MAGIC     store_kring_agg
+-- MAGIC );
+-- MAGIC 
+-- MAGIC -- kring = 20
+-- MAGIC create
+-- MAGIC or replace temp view store_k20 as (
+-- MAGIC   select
+-- MAGIC     cell as store_cell,
+-- MAGIC     explode(k20) as k_cell,
+-- MAGIC     20 as ring_k,
+-- MAGIC     county,
+-- MAGIC     zip_code,
+-- MAGIC     entity_name,
+-- MAGIC     establishment_type,
+-- MAGIC     license_number
+-- MAGIC   from
+-- MAGIC     store_kring_agg
+-- MAGIC );
+-- MAGIC select
+-- MAGIC   *
+-- MAGIC from
+-- MAGIC   store_k5;
+-- MAGIC -- select * from store_k10;
+-- MAGIC   -- select * from store_k15;
+-- MAGIC   -- select * from store_k20;
+-- MAGIC   -- select format_number(count(*),0) as count from store_k5;
+-- MAGIC   -- select format_number(count(*),0) as count from store_k10;
+-- MAGIC   -- select format_number(count(*),0) as count from store_k15;
+-- MAGIC   -- select format_number(count(*),0) as count from store_k20;
+
+-- COMMAND ----------
+
+-- MAGIC %md __Subtract K-Ring Cells out at each of the given Ring Levels__
+-- MAGIC 
+-- MAGIC > This yield gap areas that are not accessible at a given k-ring level.
+-- MAGIC 
+-- MAGIC ```
+-- MAGIC count all NTA cells? 2,536,715
+-- MAGIC ...cells outside K-Ring=5 areas? 2,013,961
+-- MAGIC ...cells outside K-Ring=10 areas? 1,498,437
+-- MAGIC ...cells outside K-Ring=15 areas? 1,147,727
+-- MAGIC ...cells outside K-Ring=20 areas? 898,175
+-- MAGIC ```
+
+-- COMMAND ----------
+
+-- MAGIC %sql -- nta cells outside kring = 5
+-- MAGIC create
+-- MAGIC or replace temp view nta_no_k5 as (
+-- MAGIC   select
+-- MAGIC     cell
+-- MAGIC   from
+-- MAGIC     nta_pop_cell
+-- MAGIC   except
+-- MAGIC   select
+-- MAGIC     k_cell as cell
+-- MAGIC   from
+-- MAGIC     store_k5
+-- MAGIC );
+-- MAGIC 
+-- MAGIC  -- nta cells outside kring = 10
+-- MAGIC create
+-- MAGIC or replace temp view nta_no_k10 as (
+-- MAGIC   select
+-- MAGIC     cell
+-- MAGIC   from
+-- MAGIC     nta_pop_cell
+-- MAGIC   except
+-- MAGIC   select
+-- MAGIC     k_cell as cell
+-- MAGIC   from
+-- MAGIC     store_k10
+-- MAGIC );
+-- MAGIC 
+-- MAGIC  -- nta cells outside kring = 15
+-- MAGIC create
+-- MAGIC or replace temp view nta_no_k15 as (
+-- MAGIC   select
+-- MAGIC     cell
+-- MAGIC   from
+-- MAGIC     nta_pop_cell
+-- MAGIC   except
+-- MAGIC   select
+-- MAGIC     k_cell as cell
+-- MAGIC   from
+-- MAGIC     store_k15
+-- MAGIC );
+-- MAGIC 
+-- MAGIC  -- nta cells outside kring = 20
+-- MAGIC create
+-- MAGIC or replace temp view nta_no_k20 as (
+-- MAGIC   select
+-- MAGIC     cell
+-- MAGIC   from
+-- MAGIC     nta_pop_cell
+-- MAGIC   except
+-- MAGIC   select
+-- MAGIC     k_cell as cell
+-- MAGIC   from
+-- MAGIC     store_k20
+-- MAGIC );
+-- MAGIC -- select * from nta_no_k5;
+-- MAGIC -- select * from nta_no_k10;
+-- MAGIC -- select * from nta_no_k15;
+-- MAGIC -- select * from nta_no_k20;
+-- MAGIC -- select format_number(count(*),0) as count from nta_no_k5;
+-- MAGIC -- select format_number(count(*),0) as count from nta_no_k10;
+-- MAGIC -- select format_number(count(*),0) as count from nta_no_k15;
+-- MAGIC -- select format_number(count(*),0) as count from nta_no_k20;
+
+-- COMMAND ----------
+
+-- MAGIC %sql -- combine into single view for each kring level
+-- MAGIC create
+-- MAGIC or replace temp view nta_no as (
+-- MAGIC   select
+-- MAGIC     *
+-- MAGIC   except(
+-- MAGIC       t5.cell,
+-- MAGIC       t10.cell,
+-- MAGIC       t15.cell,
+-- MAGIC       t20.cell,
+-- MAGIC       in_kring_5,
+-- MAGIC       in_kring_10,
+-- MAGIC       in_kring_15,
+-- MAGIC       in_kring_20
+-- MAGIC     ),
+-- MAGIC     case
+-- MAGIC       when isnull(t5.in_kring_5) then True
+-- MAGIC       else False
+-- MAGIC     end as in_kring_5,
+-- MAGIC     case
+-- MAGIC       when isnull(t10.in_kring_10) then True
+-- MAGIC       else False
+-- MAGIC     end as in_kring_10,
+-- MAGIC     case
+-- MAGIC       when isnull(t15.in_kring_15) then True
+-- MAGIC       else False
+-- MAGIC     end as in_kring_15,
+-- MAGIC     case
+-- MAGIC       when isnull(t20.in_kring_20) then True
+-- MAGIC       else False
+-- MAGIC     end as in_kring_20
+-- MAGIC   from
+-- MAGIC     nta_pop_cell as s
+-- MAGIC     left outer join (
+-- MAGIC       select
+-- MAGIC         *,
+-- MAGIC         False as in_kring_5
+-- MAGIC       from
+-- MAGIC         nta_no_k5
+-- MAGIC     ) as t5 on s.cell == t5.cell
+-- MAGIC     left outer join (
+-- MAGIC       select
+-- MAGIC         *,
+-- MAGIC         False as in_kring_10
+-- MAGIC       from
+-- MAGIC         nta_no_k10
+-- MAGIC     ) as t10 on s.cell == t10.cell
+-- MAGIC     left outer join (
+-- MAGIC       select
+-- MAGIC         *,
+-- MAGIC         False as in_kring_15
+-- MAGIC       from
+-- MAGIC         nta_no_k15
+-- MAGIC     ) as t15 on s.cell == t15.cell
+-- MAGIC     left outer join (
+-- MAGIC       select
+-- MAGIC         *,
+-- MAGIC         False as in_kring_20
+-- MAGIC       from
+-- MAGIC         nta_no_k20
+-- MAGIC     ) as t20 on s.cell == t20.cell
+-- MAGIC );
+-- MAGIC 
+-- MAGIC select * from nta_no; 
+-- MAGIC  -- select format_number(count(*),0) as count from nta_no;
+
+-- COMMAND ----------
+
+-- MAGIC %md __Which NTAs have the greatest number of cells outside the food store k-rings?__
+-- MAGIC 
+-- MAGIC > Limiting to 25 for visualization purposes. See that `QN99`, `SI05`, `QN98`, `BK99`, and `BX99` round out the Top (or Worst) 5. 
+-- MAGIC 
+-- MAGIC _Screenshot included for reading outside Databricks and to show some additional rendering tweaks._
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC plt.figure(figsize=(15, 5))
+-- MAGIC plt.imshow(img.imread("Resources/lowest_kring_20_cells.png"), aspect='auto')
+-- MAGIC plt.show()
+
+-- COMMAND ----------
+
+-- MAGIC %sql
+-- MAGIC select
+-- MAGIC   *
+-- MAGIC except(t10.ntacode, t15.ntacode, t20.ntacode)
+-- MAGIC from
+-- MAGIC   (
+-- MAGIC     select
+-- MAGIC       ntacode,
+-- MAGIC       count(*) as count_no_k5
+-- MAGIC     from nta_no
+-- MAGIC     where in_kring_5 == False
+-- MAGIC     group by ntacode
+-- MAGIC   ) as t5
+-- MAGIC   join (
+-- MAGIC     select
+-- MAGIC       ntacode,
+-- MAGIC       count(*) as count_no_k10
+-- MAGIC     from nta_no
+-- MAGIC     where in_kring_10 == False
+-- MAGIC     group by ntacode
+-- MAGIC   ) as t10 on t5.ntacode == t10.ntacode
+-- MAGIC   join (
+-- MAGIC     select
+-- MAGIC       ntacode,
+-- MAGIC       count(*) as count_no_k15
+-- MAGIC     from nta_no
+-- MAGIC     where in_kring_15 == False
+-- MAGIC     group by ntacode
+-- MAGIC   ) as t15 on t5.ntacode == t15.ntacode
+-- MAGIC   join (
+-- MAGIC     select
+-- MAGIC       ntacode,
+-- MAGIC       count(*) as count_no_k20
+-- MAGIC     from nta_no
+-- MAGIC     where in_kring_20 == False
+-- MAGIC     group by ntacode
+-- MAGIC   ) as t20 on t5.ntacode == t20.ntacode
+-- MAGIC order by
+-- MAGIC   count_no_k20 desc
+-- MAGIC limit 25;
+
+-- COMMAND ----------
+
+-- MAGIC %md __Render For Cells Outside of K20__
+-- MAGIC 
+-- MAGIC > Hint: you can turn on | off layers in Kepler as well as mess with colors and fills after rendering.
+-- MAGIC 
+-- MAGIC _Again, screenshot included for reading outside Databricks and to show some additional rendering tweaks._
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC plt.imshow(img.imread("Resources/store_kring_20_gaps.png"), aspect='auto')
+-- MAGIC plt.show()
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC county = "Queens"    #also Bronx Queens
+-- MAGIC ntacodes = ['QN99'] #also 'BX22'
+-- MAGIC 
+-- MAGIC pdf_store = spark.table("store").select("geom_wkt", "entity_name", "county", "establishment_type", "license_number",).filter(f"county == '{county}'").toPandas()
+-- MAGIC pdf_store_cell = spark.table("store_cell").select("cell_str", "zip_code", "county").filter(col("cell_str").isNotNull()).filter(f"county == '{county}'").toPandas()
+-- MAGIC pdf_nta_no = spark.table("nta_no").filter("in_kring_20 == False").select("cell_str", "ntacode", "ntaname").filter(col("ntacode").isin(*ntacodes)).toPandas()
+-- MAGIC pdf_nta_geom = spark.table("nta_pop").select("geom_wkt", "county", "ntaname", "pop_year_2010", "pop_year_2000", "ntacode").filter(col("ntacode").isin(*ntacodes)).toPandas()
+-- MAGIC 
+-- MAGIC # -- Further Layer Tweaks --
+-- MAGIC # - For `no_k20_cell` set color to red
+-- MAGIC # - turn off fill for nta_pop geom_wkt
+-- MAGIC map_nta_config={
+-- MAGIC   'version': 'v1', 
+-- MAGIC   'mapState': {
+-- MAGIC     'latitude': 40.675544649494356, 
+-- MAGIC     'longitude': -73.81784574884483, 
+-- MAGIC     'zoom': 10.631611941798617
+-- MAGIC   }, 
+-- MAGIC   'mapStyle': {'styleType': 'satellite'},
+-- MAGIC   "options": {"readOnly": False, "centerMap": True}
+-- MAGIC } 
+-- MAGIC 
+-- MAGIC display_kepler(
+-- MAGIC   KeplerGl(
+-- MAGIC     config=map_nta_config,
+-- MAGIC     data={
+-- MAGIC       'store': pdf_store,
+-- MAGIC       'store_cell': pdf_store_cell,
+-- MAGIC       'no_k20_cell': pdf_nta_no,
+-- MAGIC       'nta_pop': pdf_nta_geom
+-- MAGIC     },
+-- MAGIC     show_docs=False
+-- MAGIC   )
+-- MAGIC )
+
+-- COMMAND ----------
+
+-- MAGIC %md ## Food Store H3 K-Rings with Roads 
+-- MAGIC 
+-- MAGIC > For each street cell determine if it is within K-Ring 20 of any store. This allows more isolation to what street locations might benefit from the addition of a food store.
+
+-- COMMAND ----------
+
+-- MAGIC %md _Generate DataFrame with __ALL 18.7M__ k-ring=20 (1/4 mile) street cells identified; also has non-streets and those outside the k-ring._
+
+-- COMMAND ----------
+
+-- MAGIC %sql 
+-- MAGIC -- store k-ring 20 no nulls
+-- MAGIC create or replace temp view store_k20_agg as (
+-- MAGIC   select cell as store_cell, true as is_k20, cell_str as store_cell_str, zip_code, entity_name, establishment_type, license_number, k20 
+-- MAGIC   from store_kring_agg
+-- MAGIC   where isnotnull(cell)
+-- MAGIC );
+-- MAGIC 
+-- MAGIC -- store k-ring 20 explode
+-- MAGIC create or replace temp view _store_k20_cell as (
+-- MAGIC   select *
+-- MAGIC   from (select explode(k20) as cell, * except(k20) from store_k20_agg)
+-- MAGIC );
+-- MAGIC 
+-- MAGIC -- full outer join street on store kring-20
+-- MAGIC create or replace temp view _street_k20 as (
+-- MAGIC   select * except(street_cell, k20_cell),
+-- MAGIC     case
+-- MAGIC       when isnull(k20_cell) then street_cell
+-- MAGIC     else k20_cell
+-- MAGIC       end as cell
+-- MAGIC   from 
+-- MAGIC     (select * except(cell), cell as k20_cell from _store_k20_cell) as t1a
+-- MAGIC     full outer join (select cell as street_cell, true as is_street_cell, name as street_name, row_id as street_row_id from street_cell) as t2a
+-- MAGIC     on t1a.k20_cell == t2a.street_cell
+-- MAGIC );
+-- MAGIC 
+-- MAGIC -- left outer join nta
+-- MAGIC create or replace temp view _nta_street_k20 as (
+-- MAGIC   select 
+-- MAGIC   * except(cell, nta_cell, is_street_cell, is_k20),
+-- MAGIC   case
+-- MAGIC       when isnull(cell) then nta_cell
+-- MAGIC     else cell
+-- MAGIC       end as cell,
+-- MAGIC   case
+-- MAGIC     when isnull(is_street_cell) then false
+-- MAGIC     else true
+-- MAGIC   end as is_street_cell,
+-- MAGIC   case
+-- MAGIC     when isnull(is_k20) then false
+-- MAGIC     else true
+-- MAGIC   end as is_k20
+-- MAGIC   from 
+-- MAGIC   _street_k20 as t1b
+-- MAGIC   left outer join (select cell as nta_cell, * except(cell, cell_str) from nta_pop_cell) as t2b
+-- MAGIC   on t1b.cell = t2b.nta_cell
+-- MAGIC );
+-- MAGIC 
+-- MAGIC -- remove duplicates 
+-- MAGIC -- went a little more restrictive with SQL, see xxhash64
+-- MAGIC create or replace temp view nta_street_k20 as (
+-- MAGIC  select 
+-- MAGIC    ntacode, cell, street_row_id, is_street_cell, is_k20, street_name, entity_name, 
+-- MAGIC    h3_h3tostring(cell) as cell_str,
+-- MAGIC    * except(row_num, ntacode, cell, street_row_id, is_street_cell, is_k20, street_name, entity_name)
+-- MAGIC  from (
+-- MAGIC  select *,
+-- MAGIC  row_number() over (partition by xxhash64(cell, ntacode, is_street_cell, is_k20) order by cell) as row_num
+-- MAGIC  from _nta_street_k20
+-- MAGIC  )
+-- MAGIC  where row_num = 1
+-- MAGIC  );
+-- MAGIC 
+-- MAGIC -- select * 
+-- MAGIC -- from nta_street_k20 
+-- MAGIC -- where isnotnull(ntacode) and not is_k20 and is_street_cell 
+-- MAGIC -- order by ntacode, street_name, cell nulls last;
+-- MAGIC 
+-- MAGIC -- select row_hash, count(*) as count
+-- MAGIC -- from nta_street_k20
+-- MAGIC -- group by row_hash
+-- MAGIC -- having count > 1;
+-- MAGIC 
+-- MAGIC -- select * from _street_k20;
+-- MAGIC select format_number(count(*),0) as count from nta_street_k20;
+-- MAGIC -- select format_number(count(*),0) as count from street_k20;
+
+-- COMMAND ----------
+
+-- MAGIC %md __Which NTAs have the fewest number of street cells within the k-ring limits?__
+-- MAGIC 
+-- MAGIC > Showing Top (or Worst) 50 for rendering.
+-- MAGIC 
+-- MAGIC _Again, screenshot included for reading outside Databricks and to show some additional rendering tweaks._
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC plt.figure(figsize=(15, 5))
+-- MAGIC plt.imshow(img.imread("Resources/lowest_kring_20_streets.png"), aspect='auto')
+-- MAGIC plt.show()
+
+-- COMMAND ----------
+
+-- MAGIC %sql
+-- MAGIC select
+-- MAGIC   ntacode,
+-- MAGIC   county,
+-- MAGIC   count(1) as count
+-- MAGIC from (select ntacode, county, cell, is_street_cell, is_k20 from nta_street_k20)
+-- MAGIC where
+-- MAGIC   is_street_cell
+-- MAGIC   and is_k20
+-- MAGIC group by
+-- MAGIC   ntacode, county
+-- MAGIC order by count
+-- MAGIC limit 50
+
+-- COMMAND ----------
+
+-- MAGIC %md __Let's look at NTA `BX22` in the Bronx__
+-- MAGIC 
+-- MAGIC > See that most food stores are on the perimeter for this NTA, with only a handful in the interior roads.
+-- MAGIC 
+-- MAGIC _Again, screenshot included for reading outside Databricks and to show some additional rendering tweaks._
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC plt.imshow(img.imread("Resources/store_street_kring_20.png"), aspect='auto')
+-- MAGIC plt.show()
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC county = "Bronx"
+-- MAGIC ntacodes = ['BX22']
+-- MAGIC 
+-- MAGIC pdf_store = spark.table("store").select("geom_wkt", "entity_name", "county", "establishment_type", "license_number",).filter(f"county == '{county}'").toPandas()
+-- MAGIC pdf_store_cell = spark.table("store_cell").select("cell_str", "zip_code", "county").filter(col("cell_str").isNotNull()).filter(f"county == '{county}'").toPandas()
+-- MAGIC pdf_nta_geom = spark.table("nta_pop").select("geom_wkt", "county", "ntaname", "pop_year_2010", "pop_year_2000", "ntacode").filter(col("ntacode").isin(*ntacodes)).toPandas()
+-- MAGIC 
+-- MAGIC pdf_street_no_k20_cell = spark.table("nta_street_k20").select("cell_str", "ntacode", "ntaname", "is_street_cell", "is_k20").filter("is_street_cell == True").filter("is_k20 == False").filter(col("ntacode").isin(*ntacodes)).distinct().toPandas()
+-- MAGIC pdf_street_k20_cell = spark.table("nta_street_k20").select("cell_str", "ntacode", "ntaname", "is_street_cell", "is_k20").filter("is_street_cell == True").filter("is_k20 == True").filter(col("ntacode").isin(*ntacodes)).distinct().toPandas()
+-- MAGIC 
+-- MAGIC # -- Optional: Layer Tweaks --
+-- MAGIC # - For `street_no_k20_cell` set color to red
+-- MAGIC # - turn off fill for `nta_pop` geom_wkt
+-- MAGIC map_street_nta_config = {
+-- MAGIC   'version': 'v1', 
+-- MAGIC   'mapState': {
+-- MAGIC     'latitude': 40.90, 
+-- MAGIC     'longitude': -73.908, 
+-- MAGIC     'zoom': 13.5
+-- MAGIC   }, 
+-- MAGIC   'mapStyle': {'styleType': 'satellite'}
+-- MAGIC } 
+-- MAGIC 
+-- MAGIC display_kepler(
+-- MAGIC   KeplerGl(
+-- MAGIC     config=map_street_nta_config,
+-- MAGIC     data={
+-- MAGIC       'store': pdf_store,
+-- MAGIC       'store_cell': pdf_store_cell,
+-- MAGIC       'street_no_k20_cell': pdf_street_no_k20_cell,
+-- MAGIC       'street_k20_cell': pdf_street_k20_cell,
+-- MAGIC       'nta_pop': pdf_nta_geom
+-- MAGIC     },
+-- MAGIC     show_docs=False
+-- MAGIC   )
+-- MAGIC )

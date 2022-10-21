@@ -1,0 +1,3 @@
+# SDSC2022 NYC - Databricks Workshop
+
+> We presented this "Building a Flexible Geospatial Lakehouse on the Databricks Platform" material to workshop attendees at CARTO's 2022 [Spatial Data Science Conference](https://spatial-data-science-conference.com/2022/newyork/#workshops) in NYC. See Overview Notebook to get started. You can bring that into your Databricks environment through [Repos](https://docs.databricks.com/repos/index.html) integration with GitHub. 
